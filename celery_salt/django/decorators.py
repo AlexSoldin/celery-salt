@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 try:
-    from django.db import models
+    from django.db import models, transaction
     from django.db.models.signals import post_delete, post_save
 
     DJANGO_AVAILABLE = True
@@ -29,6 +29,7 @@ def auto_publish(
     condition: Callable | None = None,
     event_classes: dict[str, type] | None = None,
     payload_provider: Callable[..., dict[str, Any] | None] | None = None,
+    publish_on_commit: bool = True,
 ):
     """
     Decorator for Django models that automatically publishes events on save/delete.
@@ -59,6 +60,11 @@ def auto_publish(
 
         # Both modes:
         condition: Function to conditionally publish: (instance, event_type) -> bool
+        publish_on_commit: Defer the publish until the surrounding transaction commits
+                          (default True). The payload is still built at signal time, so it
+                          reflects the row as saved. A rollback publishes nothing; outside a
+                          transaction Django runs the publish immediately. Without this,
+                          subscribers that re-read the row can run before it is committed.
 
     Example:
         def get_product_payload(instance, event_type):
@@ -187,63 +193,97 @@ def auto_publish(
 
             return True
 
-        def publish_event(
+        def build_publish(
             instance: models.Model,
             event_type: str,
             fields_changed: list[str] | None = None,
-        ):
+        ) -> Callable[[], Any] | None:
+            """Build the event from the instance now; return the call that sends it."""
+            if event_classes and event_type in event_classes:
+                event_class = event_classes[event_type]
+                try:
+                    payload = payload_provider(instance, event_type)
+                except Exception as e:
+                    logger.warning(
+                        "Payload provider failed: %s. Skipping publish.",
+                        e,
+                        extra={"model_pk": instance.pk},
+                        exc_info=True,
+                    )
+                    return None
+                if payload is None:
+                    return None  # Provider decided to skip
+                return event_class(**payload).publish
+
+            data = get_model_data(instance, fields_changed)
+            topic = f"{base_topic}.{event_type}"
+            return lambda: event_client.publish(topic, data)
+
+        def publish_event(
+            instance: models.Model,
+            event_type: str,
+            using: str | None,
+            fields_changed: list[str] | None = None,
+        ) -> None:
             """Publish an event for the model instance."""
             if not should_publish_event(instance, event_type):
                 return
 
-            try:
-                if event_classes and event_type in event_classes:
-                    event_class = event_classes[event_type]
-                    try:
-                        payload = payload_provider(instance, event_type)
-                    except Exception as e:
-                        logger.warning(
-                            f"Payload provider failed: {e}. Skipping publish.",
-                            extra={"model_pk": instance.pk},
-                            exc_info=True,
-                        )
-                        return
-                    if payload is None:
-                        return  # Provider decided to skip
-                    event_instance = event_class(**payload)
-                    event_instance.publish()
-                else:
-                    data = get_model_data(instance, fields_changed)
-                    topic = f"{base_topic}.{event_type}"
-                    event_client.publish(topic, data)
+            model_pk = instance.pk
 
-            except Exception as e:
+            def log_failure(error: Exception) -> None:
                 logger.error(
-                    f"Failed to publish {event_type} event for {model_class.__name__}: {e}",
-                    extra={"model_pk": instance.pk},
+                    "Failed to publish %s event for %s: %s",
+                    event_type,
+                    model_class.__name__,
+                    error,
+                    extra={"model_pk": model_pk},
                     exc_info=True,
                 )
 
-        def handle_post_save(sender, instance, created, **kwargs):
+            try:
+                publish = build_publish(instance, event_type, fields_changed)
+            except Exception as e:
+                log_failure(e)
+                return
+            if publish is None:
+                return
+
+            def send() -> None:
+                # An exception escaping an on_commit callback would surface in the
+                # caller's commit, so a failed publish is logged, never raised.
+                try:
+                    publish()
+                except Exception as e:
+                    log_failure(e)
+
+            if publish_on_commit:
+                transaction.on_commit(send, using=using)
+            else:
+                send()
+
+        def handle_post_save(
+            sender: type[models.Model],
+            instance: models.Model,
+            created: bool,
+            using: str | None = None,
+            **kwargs: Any,
+        ) -> None:
             """Handle post_save signal."""
             if created and "created" in events_to_publish:
-                publish_event(instance, "created")
+                publish_event(instance, "created", using)
             elif not created and "updated" in events_to_publish:
-                # Try to determine which fields changed
-                fields_changed = None
-                if hasattr(instance, "_state") and hasattr(
-                    instance._state, "fields_cache"
-                ):
-                    # This is a best-effort attempt to detect changed fields
-                    # In practice, you might want to use django-model-utils or similar
-                    pass
+                publish_event(instance, "updated", using)
 
-                publish_event(instance, "updated", fields_changed)
-
-        def handle_post_delete(sender, instance, **kwargs):
+        def handle_post_delete(
+            sender: type[models.Model],
+            instance: models.Model,
+            using: str | None = None,
+            **kwargs: Any,
+        ) -> None:
             """Handle post_delete signal."""
             if "deleted" in events_to_publish:
-                publish_event(instance, "deleted")
+                publish_event(instance, "deleted", using)
 
         # Connect signals
         if "created" in events_to_publish or "updated" in events_to_publish:
