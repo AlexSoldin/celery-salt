@@ -225,7 +225,12 @@ def auto_publish(
             using: str | None,
             fields_changed: list[str] | None = None,
         ) -> None:
-            """Publish an event for the model instance."""
+            """Publish an event for the model instance.
+
+            `using` is the database alias the signal fired on. on_commit must wait on
+            that connection's transaction: without it, a save on a non-default database
+            would wait on "default" and publish before its own transaction commits.
+            """
             if not should_publish_event(instance, event_type):
                 return
 
