@@ -5,6 +5,13 @@ All notable changes to CelerySalt will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-10-12
+
+### Added
+- `@auto_publish(soft_delete_field="deleted_at")`: a `save()` update where this field is non-null publishes `deleted` instead of `updated`, covering Coolset's save()-based soft-delete pattern where `post_delete` never fires. Single-instance saves only; bulk `queryset.update()` soft deletes still publish nothing until manager-level publishing lands.
+- Dropped-publish metric: every failure `@auto_publish` already logged and swallowed (a failing `payload_provider`, a failing publish, or a `build_publish` exception) is now also recorded via `celery_salt.metrics.collectors.get_metrics_collector().record_error(topic, "dropped_publish", ...)`, making silent drops visible without a raise that could break the caller's commit.
+- `@subscribe` now supports wildcard topics (`"#"`, `"user.*"`) without a registered schema. The routing/dispatch/broker layers already matched wildcard patterns; `@subscribe` previously still required an exact-match schema lookup that no catch-all topic could satisfy. A wildcard handler receives a permissive payload model (any fields allowed) instead of a topic-specific validated one, since no single schema applies to every topic a catch-all can receive.
+
 ## [1.5.16] - 2026-10-08
 
 ### Changed

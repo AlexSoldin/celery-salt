@@ -9,7 +9,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from celery_salt.core.event_utils import (
     ensure_schema_registered,
@@ -291,6 +291,18 @@ def _create_rpc_method(
     return call
 
 
+def _is_wildcard_topic(topic: str) -> bool:
+    """A routing-key pattern (`*`/`#`), not a single concrete topic."""
+    return "*" in topic or "#" in topic
+
+
+class _PassthroughPayload(BaseModel):
+    """Permissive payload for wildcard subscriptions: no single schema applies
+    to every topic a catch-all handler can receive."""
+
+    model_config = ConfigDict(extra="allow")
+
+
 def _resolve_subscribe_args(
     topic: str | type,
     version: str,
@@ -441,7 +453,11 @@ def subscribe(
     Args:
         topic: Either an event topic pattern (supports wildcards: user.*, #)
             or a `SaltEvent` subclass. When a `SaltEvent` subclass is passed,
-            `topic` and `version` are inferred from `event_cls.Meta`.
+            `topic` and `version` are inferred from `event_cls.Meta`. A wildcard
+            topic (containing `*` or `#`) skips schema lookup/validation entirely
+            -- there's no single schema a catch-all handler could validate
+            against -- and the handler receives a permissive model that allows
+            any fields instead of a topic-specific validated one.
         version: Schema version to validate against (default: "latest"). When
             `topic` is a `SaltEvent` subclass and `version` is left as
             `"latest"`, defaults to `event_cls.Meta.version`.
@@ -475,8 +491,11 @@ def subscribe(
             topic, version, event_cls
         )
 
-        schema = _fetch_schema(resolved_topic, resolved_version)
-        validation_model = _create_model_from_schema(schema)
+        if _is_wildcard_topic(resolved_topic):
+            validation_model = _PassthroughPayload
+        else:
+            schema = _fetch_schema(resolved_topic, resolved_version)
+            validation_model = _create_model_from_schema(schema)
         validated_handler = _create_validated_handler(
             validation_model, func, resolved_topic, resolved_event_cls
         )

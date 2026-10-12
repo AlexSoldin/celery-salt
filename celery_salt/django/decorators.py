@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from celery_salt.logging.handlers import get_logger
+from celery_salt.metrics.collectors import get_metrics_collector
 
 if TYPE_CHECKING:
     from celery_salt.integrations.client import TchuClient as EventClient
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 try:
+    from django.core.exceptions import FieldDoesNotExist
     from django.db import models, transaction
     from django.db.models.signals import post_delete, post_save
 
@@ -30,6 +32,7 @@ def auto_publish(
     event_classes: dict[str, type] | None = None,
     payload_provider: Callable[..., dict[str, Any] | None] | None = None,
     publish_on_commit: bool = True,
+    soft_delete_field: str | None = None,
 ):
     """
     Decorator for Django models that automatically publishes events on save/delete.
@@ -65,6 +68,18 @@ def auto_publish(
                           reflects the row as saved. A rollback publishes nothing; outside a
                           transaction Django runs the publish immediately. Without this,
                           subscribers that re-read the row can run before it is committed.
+        soft_delete_field: Name of a nullable field (e.g. "deleted_at") that marks a row as
+                          soft-deleted when set. Any save() update where this field is
+                          non-null publishes "deleted" instead of "updated" (including
+                          subsequent saves of an already soft-deleted row). Requires "deleted"
+                          in event_classes/publish_on to actually publish, same as
+                          post_delete's "deleted" event. Covers single-instance save() only;
+                          bulk queryset.update() soft deletes are not yet covered.
+
+    Every swallowed failure (a failing payload_provider, a failing publish, or an
+    exception from build_publish) is recorded as a "dropped_publish" error via
+    celery_salt.metrics.collectors.get_metrics_collector(), keyed by the event's
+    topic where known, in addition to the existing log line.
 
     Example:
         def get_product_payload(instance, event_type):
@@ -95,6 +110,15 @@ def auto_publish(
     def decorator(model_class):
         if not issubclass(model_class, models.Model):
             raise ValueError("auto_publish can only be applied to Django Model classes")
+
+        if soft_delete_field is not None:
+            try:
+                model_class._meta.get_field(soft_delete_field)
+            except FieldDoesNotExist as e:
+                raise ValueError(
+                    f"soft_delete_field={soft_delete_field!r} is not a field on "
+                    f"{model_class.__name__}"
+                ) from e
 
         # Get model metadata
         app_label = model_class._meta.app_label
@@ -193,6 +217,21 @@ def auto_publish(
 
             return True
 
+        def resolve_metric_topic(event_type: str) -> str:
+            """Best-effort topic name for a dropped-publish metric."""
+            if event_classes and event_type in event_classes:
+                return getattr(event_classes[event_type].Meta, "topic", event_type)
+            if base_topic:
+                return f"{base_topic}.{event_type}"
+            return event_type
+
+        def record_dropped_publish(event_type: str) -> None:
+            get_metrics_collector().record_error(
+                resolve_metric_topic(event_type),
+                "dropped_publish",
+                metadata={"model": model_class.__name__},
+            )
+
         def build_publish(
             instance: models.Model,
             event_type: str,
@@ -210,6 +249,7 @@ def auto_publish(
                         extra={"model_pk": instance.pk},
                         exc_info=True,
                     )
+                    record_dropped_publish(event_type)
                     return None
                 if payload is None:
                     return None  # Provider decided to skip
@@ -245,6 +285,7 @@ def auto_publish(
                     extra={"model_pk": model_pk},
                     exc_info=True,
                 )
+                record_dropped_publish(event_type)
 
             try:
                 publish = build_publish(instance, event_type, fields_changed)
@@ -277,8 +318,11 @@ def auto_publish(
             """Handle post_save signal."""
             if created and "created" in events_to_publish:
                 publish_event(instance, "created", using)
-            elif not created and "updated" in events_to_publish:
-                publish_event(instance, "updated", using)
+            elif not created:
+                if soft_delete_field and getattr(instance, soft_delete_field, None) is not None:
+                    publish_event(instance, "deleted", using)
+                elif "updated" in events_to_publish:
+                    publish_event(instance, "updated", using)
 
         def handle_post_delete(
             sender: type[models.Model],
@@ -291,7 +335,11 @@ def auto_publish(
                 publish_event(instance, "deleted", using)
 
         # Connect signals
-        if "created" in events_to_publish or "updated" in events_to_publish:
+        if (
+            "created" in events_to_publish
+            or "updated" in events_to_publish
+            or soft_delete_field
+        ):
             post_save.connect(handle_post_save, sender=model_class, weak=False)
 
         if "deleted" in events_to_publish:
@@ -308,6 +356,7 @@ def auto_publish(
             "condition": condition,
             "event_classes": event_classes,
             "payload_provider": payload_provider,
+            "soft_delete_field": soft_delete_field,
         }
 
         # Log configuration
