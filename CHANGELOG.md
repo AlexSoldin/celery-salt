@@ -5,6 +5,11 @@ All notable changes to CelerySalt will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.16] - 2026-10-08
+
+### Changed
+- `@auto_publish` defers publishing to `transaction.on_commit` (`publish_on_commit=True` by default). The event is still built at signal time, so the payload reflects the row as saved. A rolled-back transaction publishes nothing, and subscribers that re-read the row no longer run before it is committed. Pass `publish_on_commit=False` to keep the old in-transaction publish.
+
 ## [1.4.5] - 2026-02-01
 
 ### Fixed
